@@ -106,6 +106,8 @@ pub fn create_browser_tools() -> (SharedBrowser, Vec<Box<dyn Tool>>) {
         Box::new(BrowserNavigateTool { shared: Arc::clone(&shared) }),
         Box::new(BrowserGetUrlTool { shared: Arc::clone(&shared) }),
         Box::new(BrowserGetTextTool { shared: Arc::clone(&shared) }),
+        Box::new(BrowserFindTextTool { shared: Arc::clone(&shared) }),
+        Box::new(BrowserGetElementTool { shared: Arc::clone(&shared) }),
         Box::new(BrowserGetLinksTool { shared: Arc::clone(&shared) }),
         Box::new(BrowserClickTool { shared: Arc::clone(&shared) }),
         Box::new(BrowserTypeTool { shared: Arc::clone(&shared) }),
@@ -246,7 +248,12 @@ impl Tool for BrowserGetTextTool {
             Ok(result) => {
                 let text = result.into_value::<String>().unwrap_or_default();
                 if text.len() > max_chars {
-                    format!("{}…[truncated at {max_chars} chars]", &text[..max_chars])
+                    // Find the largest byte index ≤ max_chars that falls on a char boundary
+                    let boundary = (0..=max_chars)
+                        .rev()
+                        .find(|&i| text.is_char_boundary(i))
+                        .unwrap_or(0);
+                    format!("{}…[truncated at {max_chars} bytes]", &text[..boundary])
                 } else {
                     text
                 }
@@ -619,6 +626,182 @@ impl Tool for BrowserGetUrlTool {
             Ok(Some(url)) => url,
             Ok(None) => "about:blank".to_string(),
             Err(e) => format!("Error getting URL: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_find_text  (grep-like search within page innerText)
+// ---------------------------------------------------------------------------
+
+pub struct BrowserFindTextTool {
+    pub shared: SharedBrowser,
+}
+
+#[async_trait]
+impl Tool for BrowserFindTextTool {
+    fn name(&self) -> &str {
+        "browser_find_text"
+    }
+
+    fn description(&self) -> &str {
+        "Search for a text pattern within the current page and return matching lines with \
+         surrounding context (like grep -C). Use this instead of browser_get_text when you \
+         are looking for specific information — it avoids reading the entire page."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Text to search for (case-insensitive)"
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Number of surrounding lines to include before/after each match (default: 3)"
+                },
+                "max_matches": {
+                    "type": "integer",
+                    "description": "Maximum number of matches to return (default: 10)"
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> String {
+        let pattern = match input.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) => p.to_string(),
+            None => return "Error: 'pattern' is required".to_string(),
+        };
+        let context_lines = input
+            .get("context_lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3) as usize;
+        let max_matches = input
+            .get("max_matches")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
+
+        let guard = self.shared.lock().await;
+        let Some(state) = guard.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
+        };
+
+        // Safely embed arguments using JSON serialization
+        let pattern_json = serde_json::to_string(&pattern).unwrap_or_default();
+        let js = format!(
+            r#"(function() {{
+                var pattern = {pattern_json};
+                var contextLines = {context_lines};
+                var maxMatches = {max_matches};
+                var text = document.body ? document.body.innerText : '';
+                var lines = text.split('\n');
+                var results = [];
+                var lastEnd = -1;
+                for (var i = 0; i < lines.length && results.length < maxMatches; i++) {{
+                    if (lines[i].toLowerCase().indexOf(pattern.toLowerCase()) !== -1) {{
+                        var start = Math.max(0, i - contextLines);
+                        var end = Math.min(lines.length - 1, i + contextLines);
+                        if (start <= lastEnd) start = lastEnd + 1;
+                        if (start > end) continue;
+                        lastEnd = end;
+                        var chunk = lines.slice(start, end + 1).map(function(l, idx) {{
+                            return (start + idx === i ? '>>>' : '   ') + ' ' + l.trim();
+                        }}).filter(function(l) {{ return l.trim().length > 3; }}).join('\n');
+                        if (chunk.trim()) results.push(chunk);
+                    }}
+                }}
+                if (results.length === 0) return 'No matches found for: ' + pattern;
+                return results.join('\n---\n') + '\n(' + results.length + ' match(es))';
+            }})()"#
+        );
+
+        match state.page.evaluate(js.as_str()).await {
+            Ok(result) => result.into_value::<String>().unwrap_or_default(),
+            Err(e) => format!("Error searching page: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_get_element  (get innerText of a specific DOM element)
+// ---------------------------------------------------------------------------
+
+pub struct BrowserGetElementTool {
+    pub shared: SharedBrowser,
+}
+
+#[async_trait]
+impl Tool for BrowserGetElementTool {
+    fn name(&self) -> &str {
+        "browser_get_element"
+    }
+
+    fn description(&self) -> &str {
+        "Get the text content of a specific DOM element (CSS selector). \
+         Use this to extract a focused section of the page (e.g. 'main', 'article', \
+         '#search-results', '.listing') instead of reading the entire page with \
+         browser_get_text. Prefer this tool when the page structure is known."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector of the element to read (e.g. 'main', 'article', '#content', '.results')"
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters to return (default: 4000)"
+                }
+            },
+            "required": ["selector"]
+        })
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> String {
+        let selector = match input.get("selector").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return "Error: 'selector' is required".to_string(),
+        };
+        let max_chars = input
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4000) as usize;
+
+        let guard = self.shared.lock().await;
+        let Some(state) = guard.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
+        };
+
+        let selector_json = serde_json::to_string(&selector).unwrap_or_default();
+        let js = format!(
+            r#"(function() {{
+                var el = document.querySelector({selector_json});
+                if (!el) return 'Element not found: {selector}';
+                return el.innerText || el.textContent || '';
+            }})()"#
+        );
+
+        match state.page.evaluate(js.as_str()).await {
+            Ok(result) => {
+                let text = result.into_value::<String>().unwrap_or_default();
+                if text.len() > max_chars {
+                    let boundary = (0..=max_chars)
+                        .rev()
+                        .find(|&i| text.is_char_boundary(i))
+                        .unwrap_or(0);
+                    format!("{}…[truncated at {max_chars} bytes]", &text[..boundary])
+                } else {
+                    text
+                }
+            }
+            Err(e) => format!("Error getting element text: {e}"),
         }
     }
 }
