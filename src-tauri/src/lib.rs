@@ -16,6 +16,13 @@ use crate::agent::session_store::SessionStore;
 use crate::agent::stores::local_session_store::LocalSessionStore;
 use crate::agent::tools::browser::create_browser_tools;
 use crate::agent::tools::choice::{ChoiceTool, PendingChoices};
+use crate::agent::tools::clipboard::{ClipboardReadTool, ClipboardWriteTool};
+use crate::agent::tools::filesystem::{
+    CopyFileTool, ListDirectoryTool, MoveFileTool, ReadFileTool, SearchInFilesTool, TrashFileTool,
+    WriteFileTool,
+};
+use crate::agent::tools::http::HttpRequestTool;
+use crate::agent::tools::ssh::{SshDownloadTool, SshExecTool, SshListHostsTool, SshUploadTool};
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::time::TimeTool;
 use crate::agent::Agent;
@@ -261,6 +268,24 @@ pub fn run() {
                     Box::new(TimeTool),
                     Box::new(ShellTool),
                     Box::new(ChoiceTool::new(handle.clone(), Arc::clone(&pending_choices))),
+                    // Filesystem
+                    Box::new(ReadFileTool),
+                    Box::new(WriteFileTool),
+                    Box::new(ListDirectoryTool),
+                    Box::new(SearchInFilesTool),
+                    Box::new(MoveFileTool),
+                    Box::new(CopyFileTool),
+                    Box::new(TrashFileTool),
+                    // HTTP
+                    Box::new(HttpRequestTool::new(reqwest::Client::new())),
+                    // SSH
+                    Box::new(SshListHostsTool),
+                    Box::new(SshExecTool),
+                    Box::new(SshUploadTool),
+                    Box::new(SshDownloadTool),
+                    // Clipboard
+                    Box::new(ClipboardReadTool),
+                    Box::new(ClipboardWriteTool),
                 ];
                 tools.extend(browser_tools);
                 let agent = Agent::new(tools);
