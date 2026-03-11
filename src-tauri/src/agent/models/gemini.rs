@@ -1,13 +1,18 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::model::{Model, ModelResponse, ToolCallRequest};
-use crate::agent::session::{Message, MessageContent, Role};
+use crate::agent::model::{ConfigField, Model, ModelResponse, ToolCallRequest};
+use crate::agent::session::{Message, MessageContent, Role, Session};
 use crate::agent::tool::Tool;
 use crate::error::{AppError, Result};
 
-const GEMINI_API_BASE: &str =
-    "https://generativelanguage.googleapis.com/v1beta/models";
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+
+const SYSTEM_INSTRUCTION: &str = "\
+ユーザーへの返答は必ずマークダウン形式で記述してください。\
+日本語を基本言語として使用してください。";
 
 pub struct GeminiModel {
     model_name: String,
@@ -39,6 +44,13 @@ struct GeminiRequest {
     tools: Vec<GeminiToolDeclarations>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_config: Option<GeminiToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiSystemInstruction>,
+}
+
+#[derive(Serialize)]
+struct GeminiSystemInstruction {
+    parts: Vec<GeminiPart>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -263,21 +275,41 @@ fn messages_to_gemini_contents(messages: &[Message]) -> Vec<GeminiContent> {
 
 #[async_trait]
 impl Model for GeminiModel {
-    fn name(&self) -> &str {
+    fn model_id(&self) -> &str {
         &self.model_name
     }
 
-    fn is_available(&self) -> bool {
-        true
+    fn display_name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn required_config_keys(&self) -> Vec<String> {
+        vec!["GEMINI_API_KEY".to_string()]
+    }
+
+    fn config_fields(&self) -> Vec<ConfigField> {
+        vec![ConfigField {
+            key: "GEMINI_API_KEY".to_string(),
+            label: "Gemini API Key".to_string(),
+            is_secret: true,
+            placeholder: "AIza...".to_string(),
+        }]
     }
 
     async fn send(
         &self,
-        messages: &[Message],
+        session: Option<&Session>,
+        message: &Message,
         tools: &[Box<dyn Tool>],
-        api_key: &str,
+        settings: &HashMap<String, String>,
     ) -> Result<ModelResponse> {
-        let contents = messages_to_gemini_contents(messages);
+        let api_key = settings
+            .get("GEMINI_API_KEY")
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| AppError::MissingApiKey("Gemini".to_string()))?;
+        let mut all_messages = session.map_or_else(Vec::new, |s| s.messages.clone());
+        all_messages.push(message.clone());
+        let contents = messages_to_gemini_contents(&all_messages);
 
         let tool_declarations: Vec<GeminiFunctionDeclaration> = tools
             .iter()
@@ -307,6 +339,11 @@ impl Model for GeminiModel {
             contents,
             tools: tools_field,
             tool_config,
+            system_instruction: Some(GeminiSystemInstruction {
+                parts: vec![GeminiPart::Text {
+                    text: SYSTEM_INSTRUCTION.to_string(),
+                }],
+            }),
         };
 
         let url = format!(
@@ -314,12 +351,7 @@ impl Model for GeminiModel {
             GEMINI_API_BASE, self.model_name, api_key
         );
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();

@@ -22,6 +22,8 @@ export interface Message {
   role: Role;
   content: MessageContent;
   createdAt: string;
+  /** Which model generated this message. Undefined for user/tool messages. */
+  modelId?: string;
 }
 
 export interface Session {
@@ -45,10 +47,20 @@ export interface SessionSummary {
 }
 
 export interface Config {
-  geminiApiKey: string | null;
-  openaiApiKey: string | null;
-  anthropicApiKey: string | null;
-  defaultModel: string;
+  settings: Record<string, string>;
+}
+
+export interface ConfigField {
+  key: string;
+  label: string;
+  isSecret: boolean;
+  placeholder: string;
+}
+
+export interface ModelInfo {
+  id: string;
+  displayName: string;
+  isAvailable: boolean;
 }
 
 export interface SendMessageResponse {
@@ -68,4 +80,15 @@ export interface ChoicesPayload {
   callId: string;
   question: string;
   choices: string[];
+}
+
+export interface Playbook {
+  id: string;
+  title: string;
+  description: string;
+  steps: string[];
+  notes: string;
+  modelId?: string;
+  createdAt: string;
+  updatedAt: string;
 }

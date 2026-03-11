@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { api } from "../api";
-import type { Message, Session, SessionSummary } from "../types";
+import type { Message, ModelInfo, Session, SessionSummary } from "../types";
 
 interface UseChatOptions {
   sessionId: string | null;
@@ -16,22 +16,50 @@ export function useChat({
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState<string>("");
 
-  // Load session when sessionId changes
+  // Fetch available models once on mount
   useEffect(() => {
+    api
+      .getModels()
+      .then((list) => {
+        setModels(list);
+        // Set default to first available model if nothing selected
+        setSelectedModelId((prev) => {
+          if (prev) return prev;
+          return list.find((m) => m.isAvailable)?.id ?? "";
+        });
+      })
+      .catch((e) => console.error("Failed to load models:", e));
+  }, []);
+
+  // Load session when sessionId changes and reset transient state
+  useEffect(() => {
+    setLoading(false);
+    setError(null);
     if (!sessionId) {
       setSession(null);
       return;
     }
     api
       .getSession(sessionId)
-      .then(setSession)
+      .then((s) => {
+        setSession(s);
+        // Pre-select the model used in the last assistant message
+        const lastModelMsg = [...s.messages]
+          .reverse()
+          .find((m) => m.role === "assistant" && m.modelId);
+        if (lastModelMsg?.modelId) {
+          setSelectedModelId(lastModelMsg.modelId);
+        }
+      })
       .catch((e) => console.error("Failed to load session:", e));
   }, [sessionId]);
 
   const sendMessage = useCallback(
     async (content: string) => {
-      if (loading) return;
+      if (loading || !selectedModelId) return;
       setLoading(true);
       setError(null);
 
@@ -54,14 +82,15 @@ export function useChat({
         const response = await api.sendMessage({
           sessionId: sessionId ?? undefined,
           content,
+          modelId: selectedModelId,
         });
 
-        // If new session, create it in the parent
+        // If new session, notify parent
         if (!sessionId) {
           const summary: SessionSummary = {
             id: response.sessionId,
             title: response.sessionTitle,
-            modelName: "gemini-2.0-flash",
+            modelName: selectedModelId,
             updatedAt: new Date().toISOString(),
             totalInputTokens: 0,
             totalOutputTokens: 0,
@@ -100,8 +129,8 @@ export function useChat({
         setLoading(false);
       }
     },
-    [sessionId, loading, onSessionCreated, onSessionUpdated]
+    [sessionId, loading, selectedModelId, onSessionCreated, onSessionUpdated]
   );
 
-  return { session, loading, error, sendMessage };
+  return { session, loading, error, sendMessage, models, selectedModelId, setSelectedModelId };
 }

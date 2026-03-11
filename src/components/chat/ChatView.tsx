@@ -18,15 +18,11 @@ export default function ChatView({
   onSessionCreated,
   onSessionUpdated,
 }: ChatViewProps) {
-  const { session, loading, error, sendMessage } = useChat({
-    sessionId,
-    onSessionCreated,
-    onSessionUpdated,
-  });
+  const { session, loading, error, sendMessage, models, selectedModelId, setSelectedModelId } =
+    useChat({ sessionId, onSessionCreated, onSessionUpdated });
 
   const [pendingChoices, setPendingChoices] = useState<ChoicesPayload | null>(null);
 
-  // Listen for choice requests from the backend
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<ChoicesPayload>("tool:choices", (event) => {
@@ -50,6 +46,12 @@ export default function ChatView({
     }
   };
 
+  const lastModelId = session?.messages
+    .slice()
+    .reverse()
+    .find((m) => m.role === "assistant" && m.modelId)?.modelId;
+  const headerModel = lastModelId ?? session?.modelName ?? "";
+
   return (
     <div className="flex flex-col h-full bg-slate-950">
       {/* Header */}
@@ -59,7 +61,7 @@ export default function ChatView({
         </h2>
         {session && (
           <p className="text-xs text-slate-500 mt-0.5">
-            {session.modelName} &middot;{" "}
+            {headerModel} &middot;{" "}
             {session.totalInputTokens + session.totalOutputTokens} tokens used
           </p>
         )}
@@ -82,7 +84,13 @@ export default function ChatView({
       {pendingChoices ? (
         <ChoicePanel payload={pendingChoices} onSubmit={handleChoiceSubmit} />
       ) : (
-        <ChatInput onSend={sendMessage} disabled={loading} />
+        <ChatInput
+          onSend={sendMessage}
+          disabled={loading}
+          models={models}
+          selectedModelId={selectedModelId}
+          onModelChange={setSelectedModelId}
+        />
       )}
     </div>
   );

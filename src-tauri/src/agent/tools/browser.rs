@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::ScreenshotParams;
+use futures::future::BoxFuture;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
@@ -33,9 +34,137 @@ fn url_encode_query(s: &str) -> String {
 pub type SharedBrowser = Arc<Mutex<Option<BrowserState>>>;
 
 pub struct BrowserState {
-    _browser: Browser, // keep alive so Chrome doesn't exit
-    page: chromiumoxide::Page,
+    browser: Browser,
+    active_page: Option<chromiumoxide::Page>,
     _handler: tokio::task::JoinHandle<()>,
+}
+
+impl BrowserState {
+    /// Opens `url` in a new tab and sets it as the active page.
+    async fn open(&mut self, url: &str) -> Result<String, String> {
+        let page = self
+            .browser
+            .new_page(url)
+            .await
+            .map_err(|e| format!("Failed to open tab: {e}"))?;
+        page.activate()
+            .await
+            .map_err(|e| format!("Failed to activate tab: {e}"))?;
+        let _ = tokio::time::timeout(Duration::from_secs(5), page.wait_for_navigation()).await;
+        let _ = page
+            .evaluate("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            .await;
+        let title = page
+            .get_title()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| url.to_string());
+        self.active_page = Some(page);
+        Ok(title)
+    }
+
+    /// Closes the current active tab and switches to another existing tab,
+    /// or creates a blank tab if none remain.
+    async fn close_page(&mut self) -> Result<(), String> {
+        if let Some(page) = self.active_page.take() {
+            let _ = page.close().await;
+            let pages = self
+                .browser
+                .pages()
+                .await
+                .map_err(|e| format!("Failed to list pages: {e}"))?;
+            if let Some(next) = pages.first() {
+                let _ = next.activate().await;
+                self.active_page = Some(next.clone());
+            } else {
+                let blank = self
+                    .browser
+                    .new_page("about:blank")
+                    .await
+                    .map_err(|e| format!("Failed to create blank page: {e}"))?;
+                self.active_page = Some(blank);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a JSON list of all open tabs with index, title, and url.
+    async fn list_tabs(&self) -> Result<String, String> {
+        let pages = self
+            .browser
+            .pages()
+            .await
+            .map_err(|e| format!("Failed to list pages: {e}"))?;
+        let mut items = Vec::new();
+        for (i, page) in pages.iter().enumerate() {
+            let url = page
+                .url()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "about:blank".to_string());
+            let title = page.get_title().await.ok().flatten().unwrap_or_default();
+            items.push(serde_json::json!({ "index": i, "title": title, "url": url }));
+        }
+        Ok(serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()))
+    }
+
+    /// Activates the tab at the given index and sets it as the active page.
+    async fn activate_tab(&mut self, index: usize) -> Result<String, String> {
+        let pages = self
+            .browser
+            .pages()
+            .await
+            .map_err(|e| format!("Failed to list pages: {e}"))?;
+        let page = pages
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| format!("Tab index {index} not found"))?;
+        page.activate()
+            .await
+            .map_err(|e| format!("Failed to activate tab: {e}"))?;
+        let title = page.get_title().await.ok().flatten().unwrap_or_default();
+        self.active_page = Some(page);
+        Ok(title)
+    }
+
+    /// Returns the active page, creating a blank one if none exists.
+    async fn ensure_page(&mut self) -> Result<(), String> {
+        if self.active_page.is_none() {
+            let page = self
+                .browser
+                .new_page("about:blank")
+                .await
+                .map_err(|e| format!("Failed to create page: {e}"))?;
+            self.active_page = Some(page);
+        }
+        Ok(())
+    }
+
+    /// Opens `url` in a temporary page, runs `callback`, closes the page,
+    /// and restores the previously active page.
+    async fn ephemeral_page<F, T>(&self, url: &str, callback: F) -> Result<T, String>
+    where
+        F: for<'a> FnOnce(&'a chromiumoxide::Page) -> BoxFuture<'a, Result<T, String>>,
+    {
+        let prev = self.active_page.as_ref().cloned();
+        let page = self
+            .browser
+            .new_page(url)
+            .await
+            .map_err(|e| format!("Failed to open page: {e}"))?;
+        let _ = page
+            .evaluate("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), page.wait_for_navigation()).await;
+        let result = callback(&page).await;
+        let _ = page.close().await;
+        if let Some(prev_page) = prev {
+            let _ = prev_page.activate().await;
+        }
+        result
+    }
 }
 
 fn chrome_executable() -> std::path::PathBuf {
@@ -54,9 +183,7 @@ fn chrome_executable() -> std::path::PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        std::path::PathBuf::from(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        )
+        std::path::PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -68,10 +195,10 @@ async fn launch_browser() -> Result<BrowserState, String> {
     let config = BrowserConfig::builder()
         .chrome_executable(chrome_executable())
         .with_head()
-        // Hide automation flags so sites don't detect the bot
         .arg("--disable-blink-features=AutomationControlled")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .viewport(None)
         .build()
         .map_err(|e| format!("Browser config error: {e}"))?;
 
@@ -79,18 +206,11 @@ async fn launch_browser() -> Result<BrowserState, String> {
         .await
         .map_err(|e| format!("Failed to launch Chrome: {e}"))?;
 
-    let handler_task = tokio::spawn(async move {
-        while let Some(_) = handler.next().await {}
-    });
-
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .map_err(|e| format!("Failed to create browser page: {e}"))?;
+    let handler_task = tokio::spawn(async move { while let Some(_) = handler.next().await {} });
 
     Ok(BrowserState {
-        _browser: browser,
-        page,
+        browser,
+        active_page: None,
         _handler: handler_task,
     })
 }
@@ -102,19 +222,149 @@ async fn launch_browser() -> Result<BrowserState, String> {
 pub fn create_browser_tools() -> (SharedBrowser, Vec<Box<dyn Tool>>) {
     let shared: SharedBrowser = Arc::new(Mutex::new(None));
     let tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(BrowserSearchTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserNavigateTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserGetUrlTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserGetTextTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserFindTextTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserGetElementTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserGetLinksTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserClickTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserTypeTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserScreenshotTool { shared: Arc::clone(&shared) }),
-        Box::new(BrowserCloseTool { shared: Arc::clone(&shared) }),
+        Box::new(BrowserSearchTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserNavigateTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserGetUrlTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserGetTextTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserFindTextTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserGetElementTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserQuerySelectorAllTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserGetLinksTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserClickTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserTypeTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserScreenshotTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserCloseTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserOpenTabTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserCloseTabTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserListTabsTool {
+            shared: Arc::clone(&shared),
+        }),
+        Box::new(BrowserActivateTabTool {
+            shared: Arc::clone(&shared),
+        }),
     ];
     (shared, tools)
+}
+
+// ---------------------------------------------------------------------------
+// browser_search
+// ---------------------------------------------------------------------------
+
+pub struct BrowserSearchTool {
+    pub shared: SharedBrowser,
+}
+
+#[async_trait]
+impl Tool for BrowserSearchTool {
+    fn name(&self) -> &str {
+        "browser_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search the web by navigating directly to Google search results. \
+         This is the PREFERRED way to search — much more reliable than typing in the \
+         search box. Use this whenever you need to search for something. \
+         Returns a JSON array of {title, url, description} objects."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query (Japanese or English)"
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> String {
+        let query = match input.get("query").and_then(|v| v.as_str()) {
+            Some(q) => q.to_string(),
+            None => return "Error: 'query' is required".to_string(),
+        };
+
+        let url = format!(
+            "https://www.google.com/search?q={}&hl=ja",
+            url_encode_query(&query)
+        );
+
+        let mut guard = self.shared.lock().await;
+        if guard.is_none() {
+            match launch_browser().await {
+                Ok(state) => *guard = Some(state),
+                Err(e) => return e,
+            }
+        }
+
+        let state = guard.as_ref().unwrap();
+        match state
+            .ephemeral_page(&url, |page| {
+                Box::pin(async move {
+                    let js = r#"(function() {
+                        var rso = document.querySelector('#rso');
+                        if (!rso) return '[]';
+                        var items = rso.querySelectorAll('[data-rpos]');
+                        var results = [];
+                        items.forEach(function(item) {
+                            var h3 = item.querySelector('h3');
+                            if (!h3) return;
+                            var anchor = h3.closest('a');
+                            if (!anchor) return;
+                            var url = anchor.href || '';
+                            var title = (h3.innerText || h3.textContent || '').trim();
+                            var descEl = item.querySelector('div[style*="-webkit-line-clamp"]');
+                            var desc = descEl
+                                ? (descEl.innerText || descEl.textContent || '').trim()
+                                : '';
+                            if (title) results.push({ title: title, url: url, description: desc });
+                        });
+                        return JSON.stringify(results);
+                    })()"#;
+                    match page.evaluate(js).await {
+                        Ok(val) => Ok(val
+                            .into_value::<String>()
+                            .unwrap_or_else(|_| "[]".to_string())),
+                        Err(e) => Err(format!("Error extracting results: {e}")),
+                    }
+                })
+            })
+            .await
+        {
+            Ok(json) => json,
+            Err(e) => format!("Search error: {e}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,32 +414,25 @@ impl Tool for BrowserNavigateTool {
             }
         }
 
-        let state = guard.as_ref().unwrap();
-        match state.page.goto(&url).await {
+        let state = guard.as_mut().unwrap();
+        if let Err(e) = state.ensure_page().await {
+            return e;
+        }
+        let page = state.active_page.as_ref().unwrap();
+
+        match page.goto(&url).await {
             Ok(_) => {
-                // Give the page a moment to finish loading
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    state.page.wait_for_navigation(),
-                )
-                .await;
-
-                // Mask navigator.webdriver to reduce bot detection
-                let _ = state
-                    .page
-                    .evaluate(
-                        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})",
-                    )
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), page.wait_for_navigation()).await;
+                let _ = page
+                    .evaluate("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
                     .await;
-
-                let title = state
-                    .page
+                let title = page
                     .get_title()
                     .await
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| url.clone());
-
                 format!("Navigated to: {url}\nPage title: {title}")
             }
             Err(e) => format!("Navigation error: {e}"),
@@ -239,16 +482,17 @@ impl Tool for BrowserGetTextTool {
         let Some(state) = guard.as_ref() else {
             return "Browser not open. Use browser_navigate to open a URL first.".to_string();
         };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open. Use browser_navigate to open a URL first.".to_string();
+        };
 
-        match state
-            .page
+        match page
             .evaluate("document.body ? document.body.innerText : ''")
             .await
         {
             Ok(result) => {
                 let text = result.into_value::<String>().unwrap_or_default();
                 if text.len() > max_chars {
-                    // Find the largest byte index ≤ max_chars that falls on a char boundary
                     let boundary = (0..=max_chars)
                         .rev()
                         .find(|&i| text.is_char_boundary(i))
@@ -304,6 +548,9 @@ impl Tool for BrowserGetLinksTool {
         let Some(state) = guard.as_ref() else {
             return "Browser not open. Use browser_navigate first.".to_string();
         };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
+        };
 
         let js = format!(
             r#"JSON.stringify(
@@ -314,7 +561,7 @@ impl Tool for BrowserGetLinksTool {
             )"#
         );
 
-        match state.page.evaluate(js.as_str()).await {
+        match page.evaluate(js.as_str()).await {
             Ok(result) => result.into_value::<String>().unwrap_or_default(),
             Err(e) => format!("Error getting links: {e}"),
         }
@@ -359,38 +606,30 @@ impl Tool for BrowserClickTool {
             None => return "Error: 'selector' is required".to_string(),
         };
 
-        let result = {
-            let guard = self.shared.lock().await;
-            let Some(state) = guard.as_ref() else {
-                return "Browser not open.".to_string();
-            };
-            match state.page.find_element(&selector).await {
-                Ok(elem) => match elem.click().await {
-                    Ok(_) => {
-                        // Wait for navigation that may be triggered by the click (up to 4 s)
-                        let navigated = tokio::time::timeout(
-                            Duration::from_secs(4),
-                            state.page.wait_for_navigation(),
-                        )
-                        .await
-                        .is_ok();
-                        Ok(navigated)
-                    }
-                    Err(e) => Err(format!("Click error on '{selector}': {e}")),
-                },
-                Err(e) => Err(format!("Element not found '{selector}': {e}")),
-            }
+        let guard = self.shared.lock().await;
+        let Some(state) = guard.as_ref() else {
+            return "Browser not open.".to_string();
+        };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open.".to_string();
         };
 
-        match result {
-            Ok(navigated) => {
-                if navigated {
-                    format!("Clicked '{selector}' — page navigated")
-                } else {
-                    format!("Clicked '{selector}' — no navigation detected")
+        match page.find_element(&selector).await {
+            Ok(elem) => match elem.click().await {
+                Ok(_) => {
+                    let navigated =
+                        tokio::time::timeout(Duration::from_secs(4), page.wait_for_navigation())
+                            .await
+                            .is_ok();
+                    if navigated {
+                        format!("Clicked '{selector}' — page navigated")
+                    } else {
+                        format!("Clicked '{selector}' — no navigation detected")
+                    }
                 }
-            }
-            Err(e) => e,
+                Err(e) => format!("Click error on '{selector}': {e}"),
+            },
+            Err(e) => format!("Element not found '{selector}': {e}"),
         }
     }
 }
@@ -449,71 +688,56 @@ impl Tool for BrowserTypeTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let result = {
-            let guard = self.shared.lock().await;
-            let Some(state) = guard.as_ref() else {
-                return "Browser not open.".to_string();
-            };
-
-            // Clear the existing field value via JS
-            let safe_selector = selector.replace('\'', "\\'");
-            let clear_js = format!(
-                "(function(){{ var el=document.querySelector('{safe_selector}'); \
-                 if(el){{el.value='';el.dispatchEvent(new Event('input',{{bubbles:true}}));return true;}} \
-                 return false; }})()"
-            );
-            let _ = state.page.evaluate(clear_js.as_str()).await;
-
-            match state.page.find_element(&selector).await {
-                Ok(elem) => match elem.type_str(&text).await {
-                    Ok(_) => {
-                        if submit {
-                            // 1. Keyboard events (for event-listener driven sites)
-                            // 2. form.requestSubmit() (correct browser-like submit, triggers validation)
-                            // 3. form.submit() fallback
-                            let submit_js = format!(
-                                r#"(function(){{
-                                    var el=document.querySelector('{safe_selector}');
-                                    if(!el)return;
-                                    ['keydown','keypress','keyup'].forEach(function(t){{
-                                        el.dispatchEvent(new KeyboardEvent(t,{{
-                                            key:'Enter',code:'Enter',keyCode:13,
-                                            which:13,bubbles:true,cancelable:true
-                                        }}));
-                                    }});
-                                    if(el.form){{
-                                        try{{el.form.requestSubmit();}}
-                                        catch(e){{try{{el.form.submit();}}catch(e2){{}}}}
-                                    }}
-                                }})()"#
-                            );
-                            let _ = state.page.evaluate(submit_js.as_str()).await;
-                            // Wait for the navigation that the submit triggers
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(6),
-                                state.page.wait_for_navigation(),
-                            )
-                            .await;
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    }
-                    Err(e) => Err(format!("Type error on '{selector}': {e}")),
-                },
-                Err(e) => Err(format!("Element not found '{selector}': {e}")),
-            }
+        let guard = self.shared.lock().await;
+        let Some(state) = guard.as_ref() else {
+            return "Browser not open.".to_string();
+        };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open.".to_string();
         };
 
-        match result {
-            Ok(submitted) => {
-                if submitted {
-                    format!("Typed '{text}' into '{selector}' and submitted")
-                } else {
-                    format!("Typed '{text}' into '{selector}'")
+        let safe_selector = selector.replace('\'', "\\'");
+        let clear_js = format!(
+            "(function(){{ var el=document.querySelector('{safe_selector}'); \
+             if(el){{el.value='';el.dispatchEvent(new Event('input',{{bubbles:true}}));return true;}} \
+             return false; }})()"
+        );
+        let _ = page.evaluate(clear_js.as_str()).await;
+
+        match page.find_element(&selector).await {
+            Ok(elem) => match elem.type_str(&text).await {
+                Ok(_) => {
+                    if submit {
+                        let submit_js = format!(
+                            r#"(function(){{
+                                var el=document.querySelector('{safe_selector}');
+                                if(!el)return;
+                                ['keydown','keypress','keyup'].forEach(function(t){{
+                                    el.dispatchEvent(new KeyboardEvent(t,{{
+                                        key:'Enter',code:'Enter',keyCode:13,
+                                        which:13,bubbles:true,cancelable:true
+                                    }}));
+                                }});
+                                if(el.form){{
+                                    try{{el.form.requestSubmit();}}
+                                    catch(e){{try{{el.form.submit();}}catch(e2){{}}}}
+                                }}
+                            }})();"#
+                        );
+                        let _ = page.evaluate(submit_js.as_str()).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(6),
+                            page.wait_for_navigation(),
+                        )
+                        .await;
+                        format!("Typed '{text}' into '{selector}' and submitted")
+                    } else {
+                        format!("Typed '{text}' into '{selector}'")
+                    }
                 }
-            }
-            Err(e) => e,
+                Err(e) => format!("Type error on '{selector}': {e}"),
+            },
+            Err(e) => format!("Element not found '{selector}': {e}"),
         }
     }
 }
@@ -546,15 +770,13 @@ impl Tool for BrowserScreenshotTool {
         let Some(state) = guard.as_ref() else {
             return "Browser not open. Use browser_navigate first.".to_string();
         };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
+        };
 
-        match state
-            .page
-            .screenshot(ScreenshotParams::builder().build())
-            .await
-        {
+        match page.screenshot(ScreenshotParams::builder().build()).await {
             Ok(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                // Prefixed so gemini.rs can attach this as an inlineData image part
                 format!("SCREENSHOT:image/png:{b64}")
             }
             Err(e) => format!("Screenshot error: {e}"),
@@ -589,7 +811,7 @@ impl Tool for BrowserCloseTool {
         if guard.is_none() {
             return "Browser is not currently open.".to_string();
         }
-        *guard = None; // drops BrowserState → Chrome exits
+        *guard = None;
         "Browser closed.".to_string()
     }
 }
@@ -622,7 +844,11 @@ impl Tool for BrowserGetUrlTool {
         let Some(state) = guard.as_ref() else {
             return "Browser not open.".to_string();
         };
-        match state.page.url().await {
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open.".to_string();
+        };
+
+        match page.url().await {
             Ok(Some(url)) => url,
             Ok(None) => "about:blank".to_string(),
             Err(e) => format!("Error getting URL: {e}"),
@@ -689,8 +915,10 @@ impl Tool for BrowserFindTextTool {
         let Some(state) = guard.as_ref() else {
             return "Browser not open. Use browser_navigate first.".to_string();
         };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
+        };
 
-        // Safely embed arguments using JSON serialization
         let pattern_json = serde_json::to_string(&pattern).unwrap_or_default();
         let js = format!(
             r#"(function() {{
@@ -719,7 +947,7 @@ impl Tool for BrowserFindTextTool {
             }})()"#
         );
 
-        match state.page.evaluate(js.as_str()).await {
+        match page.evaluate(js.as_str()).await {
             Ok(result) => result.into_value::<String>().unwrap_or_default(),
             Err(e) => format!("Error searching page: {e}"),
         }
@@ -778,6 +1006,9 @@ impl Tool for BrowserGetElementTool {
         let Some(state) = guard.as_ref() else {
             return "Browser not open. Use browser_navigate first.".to_string();
         };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
+        };
 
         let selector_json = serde_json::to_string(&selector).unwrap_or_default();
         let js = format!(
@@ -788,7 +1019,7 @@ impl Tool for BrowserGetElementTool {
             }})()"#
         );
 
-        match state.page.evaluate(js.as_str()).await {
+        match page.evaluate(js.as_str()).await {
             Ok(result) => {
                 let text = result.into_value::<String>().unwrap_or_default();
                 if text.len() > max_chars {
@@ -807,48 +1038,128 @@ impl Tool for BrowserGetElementTool {
 }
 
 // ---------------------------------------------------------------------------
-// browser_search  (navigates directly to Google search URL — most reliable)
+// browser_query_selector_all  (outerHTML of every element matching a CSS selector)
 // ---------------------------------------------------------------------------
 
-pub struct BrowserSearchTool {
+pub struct BrowserQuerySelectorAllTool {
     pub shared: SharedBrowser,
 }
 
 #[async_trait]
-impl Tool for BrowserSearchTool {
+impl Tool for BrowserQuerySelectorAllTool {
     fn name(&self) -> &str {
-        "browser_search"
+        "browser_query_selector_all"
     }
 
     fn description(&self) -> &str {
-        "Search the web by navigating directly to Google search results. \
-         This is the PREFERRED way to search — much more reliable than typing in the \
-         search box. Use this whenever you need to search for something."
+        "Returns the outerHTML of every DOM element that matches a CSS selector — \
+         equivalent to Array.from(document.querySelectorAll(selector)).map(e => e.outerHTML). \
+         Useful for extracting repeated structures such as search result cards, table rows, \
+         or list items. Returns a JSON array of HTML strings."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": {
+                "selector": {
                     "type": "string",
-                    "description": "The search query (Japanese or English)"
+                    "description": "CSS selector (e.g. 'li.result', 'tr', '.card', 'a[data-id]')"
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum total characters to return across all elements (default: 8000)"
                 }
             },
-            "required": ["query"]
+            "required": ["selector"]
         })
     }
 
     async fn execute(&self, input: serde_json::Value) -> String {
-        let query = match input.get("query").and_then(|v| v.as_str()) {
-            Some(q) => q.to_string(),
-            None => return "Error: 'query' is required".to_string(),
+        let selector = match input.get("selector").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return "Error: 'selector' is required".to_string(),
+        };
+        let max_chars = input
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8000) as usize;
+
+        let guard = self.shared.lock().await;
+        let Some(state) = guard.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
+        };
+        let Some(page) = state.active_page.as_ref() else {
+            return "Browser not open. Use browser_navigate first.".to_string();
         };
 
-        let url = format!(
-            "https://www.google.com/search?q={}&hl=ja",
-            url_encode_query(&query)
+        let selector_json = serde_json::to_string(&selector).unwrap_or_default();
+        let js = format!(
+            r#"JSON.stringify(
+                Array.from(document.querySelectorAll({selector_json}))
+                    .map(function(e) {{ return e.outerHTML; }})
+            )"#
         );
+
+        match page.evaluate(js.as_str()).await {
+            Ok(result) => {
+                let json_str = result.into_value::<String>().unwrap_or_default();
+                if json_str.len() > max_chars {
+                    let boundary = (0..=max_chars)
+                        .rev()
+                        .find(|&i| json_str.is_char_boundary(i))
+                        .unwrap_or(0);
+                    format!("{}…[truncated at {max_chars} chars]", &json_str[..boundary])
+                } else if json_str == "[]" {
+                    format!("No elements matched selector: {selector}")
+                } else {
+                    json_str
+                }
+            }
+            Err(e) => format!("Error running querySelectorAll: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_open_tab
+// ---------------------------------------------------------------------------
+
+pub struct BrowserOpenTabTool {
+    pub shared: SharedBrowser,
+}
+
+#[async_trait]
+impl Tool for BrowserOpenTabTool {
+    fn name(&self) -> &str {
+        "browser_open_tab"
+    }
+
+    fn description(&self) -> &str {
+        "Opens a URL in a NEW browser tab and makes it the active tab. \
+         Use this instead of browser_navigate when you want to preserve the current page. \
+         Each agent session should open its own tab with this tool and close it with \
+         browser_close_tab when finished."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Full URL to open in a new tab (e.g. https://www.example.com)"
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> String {
+        let url = match input.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u.to_string(),
+            None => return "Error: 'url' is required".to_string(),
+        };
 
         let mut guard = self.shared.lock().await;
         if guard.is_none() {
@@ -858,30 +1169,130 @@ impl Tool for BrowserSearchTool {
             }
         }
 
-        let state = guard.as_ref().unwrap();
-        match state.page.goto(&url).await {
-            Ok(_) => {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    state.page.wait_for_navigation(),
-                )
-                .await;
-                let _ = state
-                    .page
-                    .evaluate(
-                        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})",
-                    )
-                    .await;
-                let title = state
-                    .page
-                    .get_title()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                format!("Searched Google for: '{query}'\nPage title: {title}")
-            }
-            Err(e) => format!("Search error: {e}"),
+        let state = guard.as_mut().unwrap();
+        match state.open(&url).await {
+            Ok(title) => format!("Opened new tab: {url}\nPage title: {title}"),
+            Err(e) => format!("Error opening tab: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_close_tab
+// ---------------------------------------------------------------------------
+
+pub struct BrowserCloseTabTool {
+    pub shared: SharedBrowser,
+}
+
+#[async_trait]
+impl Tool for BrowserCloseTabTool {
+    fn name(&self) -> &str {
+        "browser_close_tab"
+    }
+
+    fn description(&self) -> &str {
+        "Closes the current active tab and switches focus to another open tab. \
+         If no other tabs exist, a blank tab is created. \
+         Use this to clean up after a session that opened its own tab with browser_open_tab."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _input: serde_json::Value) -> String {
+        let mut guard = self.shared.lock().await;
+        let Some(state) = guard.as_mut() else {
+            return "Browser not open.".to_string();
+        };
+        match state.close_page().await {
+            Ok(()) => "Tab closed.".to_string(),
+            Err(e) => format!("Error closing tab: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_list_tabs
+// ---------------------------------------------------------------------------
+
+pub struct BrowserListTabsTool {
+    pub shared: SharedBrowser,
+}
+
+#[async_trait]
+impl Tool for BrowserListTabsTool {
+    fn name(&self) -> &str {
+        "browser_list_tabs"
+    }
+
+    fn description(&self) -> &str {
+        "Returns a JSON array of all open browser tabs with their index, title, and url. \
+         Use the index value with browser_activate_tab to switch to a specific tab."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _input: serde_json::Value) -> String {
+        let guard = self.shared.lock().await;
+        let Some(state) = guard.as_ref() else {
+            return "Browser not open.".to_string();
+        };
+        match state.list_tabs().await {
+            Ok(json) => json,
+            Err(e) => format!("Error listing tabs: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_activate_tab
+// ---------------------------------------------------------------------------
+
+pub struct BrowserActivateTabTool {
+    pub shared: SharedBrowser,
+}
+
+#[async_trait]
+impl Tool for BrowserActivateTabTool {
+    fn name(&self) -> &str {
+        "browser_activate_tab"
+    }
+
+    fn description(&self) -> &str {
+        "Switches the active tab to the tab at the given index. \
+         Use browser_list_tabs first to find the index of the tab you want."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "description": "Zero-based index of the tab to activate (from browser_list_tabs)"
+                }
+            },
+            "required": ["index"]
+        })
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> String {
+        let index = match input.get("index").and_then(|v| v.as_u64()) {
+            Some(i) => i as usize,
+            None => return "Error: 'index' is required".to_string(),
+        };
+
+        let mut guard = self.shared.lock().await;
+        let Some(state) = guard.as_mut() else {
+            return "Browser not open.".to_string();
+        };
+        match state.activate_tab(index).await {
+            Ok(title) => format!("Activated tab {index}: {title}"),
+            Err(e) => format!("Error activating tab: {e}"),
         }
     }
 }

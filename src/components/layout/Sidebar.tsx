@@ -7,6 +7,7 @@ interface SidebarProps {
   onNewChat: () => void;
   onDeleteSession: (id: string) => void;
   onOpenSettings: () => void;
+  onOpenPlaybooks: () => void;
 }
 
 export default function Sidebar({
@@ -16,6 +17,7 @@ export default function Sidebar({
   onNewChat,
   onDeleteSession,
   onOpenSettings,
+  onOpenPlaybooks,
 }: SidebarProps) {
   return (
     <aside className="flex flex-col w-64 h-full bg-slate-900 border-r border-slate-700 shrink-0">
@@ -70,8 +72,15 @@ export default function Sidebar({
         )}
       </div>
 
-      {/* Settings button */}
-      <div className="p-3 border-t border-slate-700">
+      {/* Bottom buttons */}
+      <div className="p-3 border-t border-slate-700 space-y-1">
+        <button
+          onClick={onOpenPlaybooks}
+          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 text-sm transition-colors"
+        >
+          <span>▶</span>
+          Playbooks
+        </button>
         <button
           onClick={onOpenSettings}
           className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 text-sm transition-colors"

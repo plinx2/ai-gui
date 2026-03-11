@@ -1,19 +1,44 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useSessions } from "../../hooks/useSessions";
 import Sidebar from "./Sidebar";
 import ChatView from "../chat/ChatView";
 import type { SessionSummary } from "../../types";
 
-interface MainLayoutProps {
-  onOpenSettings: () => void;
+interface PlaybookRun {
+  summary: SessionSummary;
+  key: number;
 }
 
-export default function MainLayout({ onOpenSettings }: MainLayoutProps) {
+interface MainLayoutProps {
+  onOpenSettings: () => void;
+  onOpenPlaybooks: () => void;
+  playbookRun: PlaybookRun | null;
+}
+
+export default function MainLayout({
+  onOpenSettings,
+  onOpenPlaybooks,
+  playbookRun,
+}: MainLayoutProps) {
+  const [chatKey, setChatKey] = useState(0);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const { sessions, deleteSession, upsertSession } = useSessions();
 
+  // When a playbook run completes, add its session to the sidebar and open it
+  useEffect(() => {
+    if (!playbookRun) return;
+    upsertSession(playbookRun.summary);
+    setChatKey((k) => k + 1);
+    setActiveSessionId(playbookRun.summary.id);
+  }, [playbookRun]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleNewChat = useCallback(() => {
+    setChatKey((k) => k + 1);
     setActiveSessionId(null);
+  }, []);
+
+  const handleSelectSession = useCallback((id: string) => {
+    setActiveSessionId(id);
   }, []);
 
   const handleSessionCreated = useCallback(
@@ -21,14 +46,14 @@ export default function MainLayout({ onOpenSettings }: MainLayoutProps) {
       upsertSession(summary);
       setActiveSessionId(summary.id);
     },
-    [upsertSession]
+    [upsertSession],
   );
 
   const handleSessionUpdated = useCallback(
     (summary: SessionSummary) => {
       upsertSession(summary);
     },
-    [upsertSession]
+    [upsertSession],
   );
 
   const handleDeleteSession = useCallback(
@@ -38,7 +63,7 @@ export default function MainLayout({ onOpenSettings }: MainLayoutProps) {
         setActiveSessionId(null);
       }
     },
-    [deleteSession, activeSessionId]
+    [deleteSession, activeSessionId],
   );
 
   return (
@@ -46,14 +71,15 @@ export default function MainLayout({ onOpenSettings }: MainLayoutProps) {
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
-        onSelectSession={setActiveSessionId}
+        onSelectSession={handleSelectSession}
         onNewChat={handleNewChat}
         onDeleteSession={handleDeleteSession}
         onOpenSettings={onOpenSettings}
+        onOpenPlaybooks={onOpenPlaybooks}
       />
       <main className="flex-1 overflow-hidden">
         <ChatView
-          key={activeSessionId ?? "new"}
+          key={chatKey}
           sessionId={activeSessionId}
           onSessionCreated={handleSessionCreated}
           onSessionUpdated={handleSessionUpdated}

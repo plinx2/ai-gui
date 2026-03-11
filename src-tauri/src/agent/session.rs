@@ -21,6 +21,9 @@ pub struct Message {
     pub role: Role,
     pub content: MessageContent,
     pub created_at: DateTime<Utc>,
+    /// Which model generated this message. None for user/tool messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
